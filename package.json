@@ -1,0 +1,41 @@
+{
+	"name": "jsimplelayout",
+	"version": "0.1.0",
+	"description": "Minimal GoldenLayout-style dynamic panel layout engine for Svelte 5. Zero dependencies.",
+	"type": "module",
+	"svelte": "./src/lib/index.ts",
+	"types": "./src/lib/index.ts",
+	"exports": {
+		".": {
+			"types": "./src/lib/index.ts",
+			"svelte": "./src/lib/index.ts",
+			"default": "./src/lib/index.ts"
+		},
+		"./LayoutArea.svelte": {
+			"svelte": "./src/lib/LayoutArea.svelte",
+			"default": "./src/lib/LayoutArea.svelte"
+		}
+	},
+	"files": [
+		"src/lib"
+	],
+	"peerDependencies": {
+		"svelte": "^5.0.0"
+	},
+	"keywords": [
+		"svelte",
+		"svelte5",
+		"layout",
+		"panel",
+		"golden-layout",
+		"split",
+		"tabs",
+		"dock",
+		"drag-and-drop"
+	],
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/GallopingChimney/JSimpleLayout"
+	}
+}
