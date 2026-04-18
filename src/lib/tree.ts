@@ -333,3 +333,26 @@ export function hitTestDropZone(
 	}
 	return null;
 }
+
+/**
+ * Hit-test the layout container edges for root-level docking.
+ * Returns a directional side if the cursor is within `threshold` pixels
+ * of the container edge, or null if not near any edge.
+ */
+export function hitTestContainerEdge(
+	container: HTMLElement | null,
+	x: number,
+	y: number,
+	threshold = 16,
+): Exclude<DropSide, 'center'> | null {
+	if (!container) return null;
+	const rect = container.getBoundingClientRect();
+	if (x < rect.left || x > rect.right || y < rect.top || y > rect.bottom) return null;
+
+	if (x - rect.left < threshold) return 'left';
+	if (rect.right - x < threshold) return 'right';
+	if (y - rect.top < threshold) return 'top';
+	if (rect.bottom - y < threshold) return 'bottom';
+
+	return null;
+}

@@ -4,7 +4,7 @@ import type { LayoutNode, StackNode, SplitNode, Tab, DropSide, DropZone, LayoutD
 import {
 	uid, resetUids, findStack, findSplit, findFirstStack, findStackByContentType,
 	cleanup, cloneTree, addTabToStack, removeTabFromStack, reorderTab, splitStack,
-	hitTestDropZone, serialize, deserialize,
+	hitTestDropZone, hitTestContainerEdge, serialize, deserialize,
 } from './tree.js';
 
 // ---------------------------------------------------------------------------
@@ -36,8 +36,15 @@ type ResizeState = {
 // ---------------------------------------------------------------------------
 
 export class LayoutState {
-	/** The reactive layout tree. All rendering flows from this. */
-	root = $state<LayoutNode>({ type: 'stack', id: uid(), tabs: [], activeTab: 0, size: 1 });
+	/** The reactive layout tree. All rendering flows from this.
+	 *  Uses $state.raw to prevent deep proxy wrapping — the tree is always
+	 *  replaced via cloneTree() after mutations. This avoids a Svelte 5 bug
+	 *  where snippet parameters share the same proxy: when split() changes
+	 *  root from StackNode to SplitNode, old snippets' @const deriveds
+	 *  re-evaluate during teardown and crash because node.tabs is undefined
+	 *  on the now-SplitNode proxy. With $state.raw, old snippet references
+	 *  point to the previous plain object (still a StackNode), not the proxy. */
+	root = $state.raw<LayoutNode>({ type: 'stack', id: uid(), tabs: [], activeTab: 0, size: 1 });
 
 	/** Currently active stack ID (receives keyboard focus). */
 	activeStackId = $state<string | null>(null);
@@ -60,6 +67,22 @@ export class LayoutState {
 	/** Callback when the active stack changes. */
 	onActiveStackChange?: (stackId: string, contentType: string) => void;
 
+	/** Callback when the "add tab" button is clicked in a stack's tab bar. */
+	onAddTab = $state<((stackId: string) => void) | undefined>(undefined);
+
+	/** Fired when a tab appears in the tree (new tab, or restored via load/setLayout).
+	 *  Drag-drop preserves tab identity — moving a tab between stacks does NOT fire this.
+	 *  Not fired for tabs present in the constructor's `initialLayout`; pass the tree through
+	 *  `setLayout()` after wiring callbacks if you need lifecycle events for an initial layout. */
+	onTabAdded?: (tab: Tab) => void;
+
+	/** Fired when a tab leaves the tree entirely (closed, or its stack destroyed).
+	 *  Drag-drop does NOT fire this — tab identity survives the move. */
+	onTabRemoved?: (tab: Tab) => void;
+
+	/** Tabs currently live in the tree, keyed by id. Used for diff-based lifecycle events. */
+	private _knownTabs = new Map<string, Tab>();
+
 	// -----------------------------------------------------------------------
 	//  Initialization
 	// -----------------------------------------------------------------------
@@ -68,6 +91,21 @@ export class LayoutState {
 		if (initialLayout) {
 			this.root = initialLayout;
 		}
+	}
+
+	/** Fire `onTabAdded` for every tab currently in the tree. Call once after wiring
+	 *  `onTabAdded` / `onTabRemoved`, to bootstrap per-tab resources for an initial layout
+	 *  passed to the constructor. Idempotent: `_knownTabs` absorbs the first pass, so any
+	 *  subsequent call is a no-op unless the tree has changed in between.
+	 *
+	 *  Usage:
+	 *    const layout = new LayoutState(restoredTree);
+	 *    layout.onTabAdded = createResourceFor;
+	 *    layout.onTabRemoved = destroyResourceFor;
+	 *    layout.init();   // fires onTabAdded for every tab in restoredTree
+	 */
+	init(): void {
+		this._reconcileTabs();
 	}
 
 	// -----------------------------------------------------------------------
@@ -84,6 +122,40 @@ export class LayoutState {
 	}
 
 	// -----------------------------------------------------------------------
+	//  Tab lifecycle reconciliation
+	//
+	//  Every PUBLIC method that mutates tab membership calls _reconcileTabs()
+	//  AT ITS END — once, after all intermediate cleanup/clone steps. Firing
+	//  on intermediate tree states (e.g. after the source-cleanup step of a
+	//  drag) would produce spurious remove+add pairs for tabs that are simply
+	//  moving between stacks. ID-diffing treats moves as no-ops by design.
+	// -----------------------------------------------------------------------
+
+	private _collectTabs(node: LayoutNode, out: Map<string, Tab>): void {
+		if (node.type === 'stack') {
+			for (const tab of node.tabs) out.set(tab.id, tab);
+		} else {
+			for (const child of node.children) this._collectTabs(child, out);
+		}
+	}
+
+	private _reconcileTabs(): void {
+		const current = new Map<string, Tab>();
+		this._collectTabs(this.root, current);
+		if (this.onTabRemoved) {
+			for (const [id, tab] of this._knownTabs) {
+				if (!current.has(id)) this.onTabRemoved(tab);
+			}
+		}
+		if (this.onTabAdded) {
+			for (const [id, tab] of current) {
+				if (!this._knownTabs.has(id)) this.onTabAdded(tab);
+			}
+		}
+		this._knownTabs = current;
+	}
+
+	// -----------------------------------------------------------------------
 	//  Public API — Tab management
 	// -----------------------------------------------------------------------
 
@@ -91,12 +163,14 @@ export class LayoutState {
 	addTab(stackId: string, tab: Tab, insertIdx?: number): void {
 		addTabToStack(this.root, stackId, tab, insertIdx);
 		this.root = cloneTree(this.root);
+		this._reconcileTabs();
 	}
 
 	/** Remove a tab by stack ID and tab index. */
 	removeTab(stackId: string, tabIdx: number): void {
 		removeTabFromStack(this.root, stackId, tabIdx);
 		this._cleanupAndApply();
+		this._reconcileTabs();
 	}
 
 	/** Add a tab to the first available stack. */
@@ -105,6 +179,7 @@ export class LayoutState {
 		if (first) {
 			addTabToStack(this.root, first.id, tab);
 			this.root = cloneTree(this.root);
+			this._reconcileTabs();
 		}
 	}
 
@@ -129,6 +204,7 @@ export class LayoutState {
 		const tabIdx = stack.tabs.findIndex(t => t.contentType === contentType);
 		if (tabIdx >= 0) stack.activeTab = tabIdx;
 		this.activeStackId = stack.id;
+		this.root = cloneTree(this.root);
 		return true;
 	}
 
@@ -145,7 +221,7 @@ export class LayoutState {
 		// Remove all tabs (makes the stack empty → cleanup will prune it)
 		stack.tabs = [];
 		stack.activeTab = 0;
-		// Cleanup to remove the empty stack
+		// Cleanup to remove the empty stack (no reconcile yet — tabs are in-flight).
 		this._cleanupAndApply();
 		// Transfer tabs to the first available stack
 		if (tabs.length > 0) {
@@ -158,6 +234,19 @@ export class LayoutState {
 				this.root = cloneTree(this.root);
 			}
 		}
+		// Single reconcile after all moves settle — prevents spurious remove/add
+		// for tabs that transferred to a surviving stack.
+		this._reconcileTabs();
+	}
+
+	/** Remove a stack and all its tabs (no redistribution). */
+	removeStack(stackId: string): void {
+		const stack = findStack(this.root, stackId);
+		if (!stack) return;
+		stack.tabs = [];
+		stack.activeTab = 0;
+		this._cleanupAndApply();
+		this._reconcileTabs();
 	}
 
 	// -----------------------------------------------------------------------
@@ -168,6 +257,7 @@ export class LayoutState {
 	split(stackId: string, tab: Tab, side: Exclude<DropSide, 'center'>): void {
 		this.root = splitStack(this.root, stackId, tab, side);
 		this._cleanupAndApply();
+		this._reconcileTabs();
 	}
 
 	// -----------------------------------------------------------------------
@@ -209,12 +299,14 @@ export class LayoutState {
 		resetUids();
 		this.root = deserialize(doc);
 		this._savedLayout = null;
+		this._reconcileTabs();
 	}
 
 	/** Replace the entire layout tree. */
 	setLayout(layout: LayoutNode): void {
 		this.root = cloneTree(layout);
 		this._savedLayout = null;
+		this._reconcileTabs();
 	}
 
 	// -----------------------------------------------------------------------
@@ -236,6 +328,7 @@ export class LayoutState {
 			if (newA >= min && newB >= min) {
 				parent.children[i].size = newA;
 				parent.children[i + 1].size = newB;
+				this.root = cloneTree(this.root);
 			}
 		}
 
@@ -257,11 +350,18 @@ export class LayoutState {
 					if (reorderIdx !== this.dragging.sourceTabIdx) {
 						reorderTab(this.root, this.dragging.sourceStackId, this.dragging.sourceTabIdx, reorderIdx);
 						this.dragging.sourceTabIdx = reorderIdx;
+						this.root = cloneTree(this.root);
 					}
 				} else {
-					// Cross-stack drag — normal drop zone hit-testing
-					const exclude = this.dragging.sourceStackId;
-					this.dropZone = hitTestDropZone(this.root, e.clientX, e.clientY, exclude, this.containerEl);
+					// Check container edges first (root-level docking)
+					const edgeSide = hitTestContainerEdge(this.containerEl, e.clientX, e.clientY);
+					if (edgeSide) {
+						this.dropZone = { stackId: '', side: edgeSide, rootEdge: true };
+					} else {
+						// Cross-stack drag — normal drop zone hit-testing
+						const exclude = this.dragging.sourceStackId;
+						this.dropZone = hitTestDropZone(this.root, e.clientX, e.clientY, exclude, this.containerEl);
+					}
 				}
 			}
 		}
@@ -271,7 +371,7 @@ export class LayoutState {
 	handlePointerUp(): void {
 		if (this.dragging?.active && this.dropZone) {
 			const { tab, sourceStackId, sourceTabIdx } = this.dragging;
-			const { stackId: targetStackId, side } = this.dropZone;
+			const { stackId: targetStackId, side, rootEdge } = this.dropZone;
 
 			// 1. Remove from source
 			removeTabFromStack(this.root, sourceStackId, sourceTabIdx);
@@ -280,18 +380,50 @@ export class LayoutState {
 			const afterRemove = cleanup(this.root);
 			if (afterRemove) this.root = afterRemove;
 
-			// 3. Re-find target and add
-			const targetExists = findStack(this.root, targetStackId);
-			if (targetExists) {
-				if (side === 'center') {
-					addTabToStack(this.root, targetStackId, tab);
+			if (rootEdge && side !== 'center') {
+				// Root-level edge dock: insert at root boundary for full-width/height
+				const direction: 'row' | 'column' = (side === 'left' || side === 'right') ? 'row' : 'column';
+				const insertBefore = (side === 'left' || side === 'top');
+				const newStack: StackNode = {
+					type: 'stack', id: uid(), size: 0.5,
+					tabs: [tab], activeTab: 0,
+				};
+
+				if (this.root.type === direction) {
+					// Same direction as root — insert at edge
+					if (insertBefore) {
+						(this.root as SplitNode).children.unshift(newStack);
+					} else {
+						(this.root as SplitNode).children.push(newStack);
+					}
+					const n = (this.root as SplitNode).children.length;
+					for (const c of (this.root as SplitNode).children) c.size = 1 / n;
 				} else {
-					this.root = splitStack(this.root, targetStackId, tab, side);
+					// Different direction or root is stack — wrap root
+					const oldRoot = { ...this.root, size: 0.5 };
+					this.root = {
+						type: direction, id: uid(), size: 1,
+						children: insertBefore ? [newStack, oldRoot] : [oldRoot, newStack],
+					} as SplitNode;
+				}
+			} else {
+				// 3. Normal: re-find target and add
+				const targetExists = findStack(this.root, targetStackId);
+				if (targetExists) {
+					if (side === 'center') {
+						addTabToStack(this.root, targetStackId, tab);
+					} else {
+						this.root = splitStack(this.root, targetStackId, tab, side);
+					}
 				}
 			}
 
 			// 4. Final cleanup + clone
 			this._cleanupAndApply();
+			// 5. Single reconcile — tab identity survived the move, so no events fire
+			//    for normal drag-drop. Only fires if drop target was rejected and the
+			//    tab effectively disappeared, which shouldn't happen in practice.
+			this._reconcileTabs();
 		}
 		this.dragging = null;
 		this.dropZone = null;
@@ -333,6 +465,7 @@ export class LayoutState {
 		const stack = findStack(this.root, stackId);
 		if (stack) {
 			stack.activeTab = tabIdx;
+			this.root = cloneTree(this.root);
 			this.activeStackId = stackId;
 			const tab = stack.tabs[tabIdx];
 			if (tab && this.onActiveStackChange) {

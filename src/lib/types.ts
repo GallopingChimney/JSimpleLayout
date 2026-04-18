@@ -39,6 +39,8 @@ export type DropSide = 'top' | 'bottom' | 'left' | 'right' | 'center';
 export type DropZone = {
 	stackId: string;
 	side: DropSide;
+	/** When true, the drop targets the root level for full-width/height docking. */
+	rootEdge?: boolean;
 };
 
 /** Serialized layout document (for persistence). */

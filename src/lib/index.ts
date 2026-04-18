@@ -33,6 +33,7 @@ export {
 	reorderTab,
 	splitStack,
 	hitTestDropZone,
+	hitTestContainerEdge,
 	serialize,
 	deserialize,
 } from './tree.js';

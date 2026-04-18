@@ -1,7 +1,8 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onMount, tick } from 'svelte';
 	import type { LayoutNode, StackNode, SplitNode, Tab, DropZone } from './types.js';
 	import { LayoutState } from './LayoutState.svelte.js';
+	import { findStack } from './tree.js';
 
 	let rootEl: HTMLElement;
 
@@ -11,32 +12,106 @@
 		renderTabIcon,
 		renderDragGhost,
 		class: className = '',
-		tabBarHeight = 32,
-		resizeHandleSize = 4,
-		resizeHitSize,
+		style: styleAttr = '',
+		tabBarHeight = 26,
+		resizeHandleSize = 2,
+		resizeHitSize = 10,
+		onshiftclose,
 	}: {
 		/** The reactive layout state instance. */
 		layout: LayoutState;
 		/** Render the content area for a tab. Receives the active tab and the stack node. */
 		renderContent: (tab: Tab, stack: StackNode) => any;
-		/** Optional: render a custom icon in the tab bar corner. Receives the active tab. */
+		/** Optional: render an icon inside each tab. Receives the tab. */
 		renderTabIcon?: (tab: Tab) => any;
 		/** Optional: render a custom drag ghost. Receives the dragged tab and cursor position. */
 		renderDragGhost?: (tab: Tab, x: number, y: number) => any;
 		/** Additional CSS classes on the root container. */
 		class?: string;
+		/** Inline style on the root container (use for CSS custom property overrides). */
+		style?: string;
 		/** Tab bar height in pixels (default 32). */
 		tabBarHeight?: number;
 		/** Resize handle visible thickness in pixels (default 4). */
 		resizeHandleSize?: number;
 		/** Resize handle grab area in pixels (default matches resizeHandleSize). */
 		resizeHitSize?: number;
+		/** Callback when Shift+click on a tab close button (close entire area). Receives stack ID and its tabs. If not set, falls back to layout.removeStack(). */
+		onshiftclose?: (stackId: string, tabs: Tab[]) => void;
 	} = $props();
 
 	onMount(() => {
 		layout.containerEl = rootEl;
 		return () => { layout.containerEl = null; };
 	});
+
+	// -----------------------------------------------------------------------
+	//  Tab overflow detection + "more" dropdown
+	// -----------------------------------------------------------------------
+
+	let overflowStacks = $state<Record<string, boolean>>({});
+	let openOverflowId = $state<string | null>(null);
+	let overflowPos = $state<{ top: number; right: number } | null>(null);
+
+	// Per-stack tab bar collapsed state (ephemeral UI, not persisted in tree)
+	let collapsedStacks = $state<Record<string, boolean>>({});
+
+	// Close overflow dropdown when drag starts
+	$effect(() => {
+		if (layout.dragging?.active) {
+			openOverflowId = null;
+			overflowPos = null;
+		}
+	});
+
+	// Close overflow dropdown if overflow clears (e.g. tab removed)
+	$effect(() => {
+		if (openOverflowId && !overflowStacks[openOverflowId]) {
+			openOverflowId = null;
+			overflowPos = null;
+		}
+	});
+
+	function observeOverflow(el: HTMLElement, stackId: string) {
+		function check() {
+			overflowStacks[stackId] = el.scrollWidth > el.clientWidth + 1;
+		}
+		const ro = new ResizeObserver(check);
+		ro.observe(el);
+		const mo = new MutationObserver(check);
+		mo.observe(el, { childList: true, subtree: true });
+		check();
+		return {
+			destroy() {
+				ro.disconnect();
+				mo.disconnect();
+				delete overflowStacks[stackId];
+			}
+		};
+	}
+
+	function toggleOverflow(stackId: string, btnRect: DOMRect) {
+		if (openOverflowId === stackId) {
+			openOverflowId = null;
+			overflowPos = null;
+		} else {
+			openOverflowId = stackId;
+			overflowPos = {
+				top: btnRect.bottom + 2,
+				right: window.innerWidth - btnRect.right,
+			};
+		}
+	}
+
+	async function scrollTabIntoView(stackId: string, tabIdx: number) {
+		await tick();
+		const stackEl = rootEl?.querySelector(`[data-stack-id="${stackId}"]`);
+		if (!stackEl) return;
+		const container = stackEl.querySelector<HTMLElement>('.jsl-tabs-scroll');
+		if (!container) return;
+		const tabEl = container.querySelector<HTMLElement>(`[data-jsl-tab-idx="${tabIdx}"]`);
+		if (tabEl) tabEl.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'nearest' });
+	}
 </script>
 
 <svelte:window
@@ -59,8 +134,52 @@
 {/if}
 
 <!-- Layout root -->
-<div class="jsl-root {className}" bind:this={rootEl}>
+<div class="jsl-root {className}" style={styleAttr} bind:this={rootEl}>
 	{@render layoutNode(layout.root)}
+
+	<!-- Root-edge drop overlay (full-width/height docking) -->
+	{#if layout.dropZone?.rootEdge && layout.dragging?.active}
+		{@const side = layout.dropZone.side}
+		<div class="jsl-drop-overlay jsl-root-drop">
+			<div
+				class="jsl-drop-zone"
+				class:jsl-drop-left={side === 'left'}
+				class:jsl-drop-right={side === 'right'}
+				class:jsl-drop-top={side === 'top'}
+				class:jsl-drop-bottom={side === 'bottom'}
+			></div>
+		</div>
+	{/if}
+
+	<!-- Overflow dropdown (position:fixed escapes overflow:hidden on ancestors) -->
+	{#if openOverflowId && overflowPos}
+		{@const overflowStack = findStack(layout.root, openOverflowId)}
+		{#if overflowStack}
+			<!-- svelte-ignore a11y_click_events_have_key_events -->
+			<!-- svelte-ignore a11y_no_static_element_interactions -->
+			<div class="jsl-overflow-backdrop" onclick={() => { openOverflowId = null; overflowPos = null; }}></div>
+			<div class="jsl-overflow-dropdown" style="top:{overflowPos.top}px; right:{overflowPos.right}px;">
+				{#each overflowStack.tabs as tab, i (tab.id)}
+					<button
+						class="jsl-overflow-item"
+						class:jsl-overflow-item-active={i === overflowStack.activeTab}
+						onclick={() => {
+							layout.activateTab(openOverflowId!, i);
+							const sid = openOverflowId!;
+							openOverflowId = null;
+							overflowPos = null;
+							scrollTabIntoView(sid, i);
+						}}
+					>
+						{#if renderTabIcon}
+							<span class="jsl-tab-icon-inline">{@render renderTabIcon(tab)}</span>
+						{/if}
+						<span>{tab.title}</span>
+					</button>
+				{/each}
+			</div>
+		{/if}
+	{/if}
 </div>
 
 <!-- ==================== Recursive renderer ==================== -->
@@ -74,13 +193,16 @@
 {/snippet}
 
 {#snippet splitPanel(node: SplitNode)}
+	<!-- Symmetric guard to stackPanel: during teardown, a split may flip to
+	     stack and node.children becomes undefined. -->
+	{@const children = node.children ?? []}
 	<div
 		class="jsl-split"
 		class:jsl-row={node.type === 'row'}
 		class:jsl-col={node.type === 'column'}
 		data-split-id={node.id}
 	>
-		{#each node.children as child, i (child.id)}
+		{#each children as child, i (child.id)}
 			<div
 				class="jsl-child"
 				style="flex: {child.size} 1 0%;"
@@ -88,7 +210,7 @@
 				{@render layoutNode(child)}
 			</div>
 
-			{#if i < node.children.length - 1}
+			{#if i < children.length - 1}
 				<div
 					class="jsl-resize-handle"
 					class:jsl-resize-h={node.type === 'row'}
@@ -105,54 +227,109 @@
 {/snippet}
 
 {#snippet stackPanel(node: StackNode)}
-	{@const activeTab = node.tabs[node.activeTab]}
+	<!-- Guard: during split() teardown, Svelte may re-evaluate @const deriveds
+	     against a node whose type just flipped from stack to split. node.tabs
+	     would be undefined, crashing `node.tabs[node.activeTab]` with
+	     "Cannot read properties of undefined (reading 'undefined')". -->
+	{@const tabs = node.tabs ?? []}
+	{@const activeTabIdx = node.activeTab ?? 0}
+	{@const activeTab = tabs[activeTabIdx]}
 	{@const isDropTarget = layout.dropZone?.stackId === node.id}
 	{@const isDragSource = layout.dragging?.sourceStackId === node.id}
+	{@const isOnlyStack = layout.root.type === 'stack'}
+	{@const isCollapsed = !!collapsedStacks[node.id]}
 	<div
 		class="jsl-stack"
+		class:jsl-stack-collapsed={isCollapsed}
 		data-stack-id={node.id}
 		onpointerdown={() => layout.activateTab(node.id, node.activeTab)}
 	>
+		<!-- Collapse/expand hover strip (always at top of stack) -->
+		<!-- svelte-ignore a11y_click_events_have_key_events -->
+		<!-- svelte-ignore a11y_no_static_element_interactions -->
+		<div
+			class="jsl-collapse-zone"
+			class:jsl-collapse-zone-collapsed={isCollapsed}
+			title={isCollapsed ? 'Show tab bar' : 'Hide tab bar'}
+			onpointerdown={(e) => e.stopPropagation()}
+			onclick={(e) => {
+				e.stopPropagation();
+				collapsedStacks[node.id] = !isCollapsed;
+			}}
+		></div>
+
+		{#if !isCollapsed}
 		<!-- Tab bar -->
 		<div class="jsl-tab-bar" style="height:{tabBarHeight}px;" data-jsl-tab-bar>
-			<!-- Area type icon -->
-			{#if activeTab}
-				<div class="jsl-tab-icon">
-					{#if renderTabIcon}
-						{@render renderTabIcon(activeTab)}
-					{/if}
-				</div>
-			{/if}
+			<!-- Scrollable tabs container (hidden scrollbar, wheel/trackpad still works) -->
+			<div class="jsl-tabs-scroll" use:observeOverflow={node.id}>
+				{#each tabs as tab, i (tab.id)}
+					{@const isActive = i === activeTabIdx}
+					{@const isBeingDragged = isDragSource && layout.dragging?.active && layout.dragging.sourceTabIdx === i}
+					<div
+						class="jsl-tab"
+						class:jsl-tab-active={isActive}
+						class:jsl-tab-dragging={isBeingDragged}
+						role="tab"
+						tabindex="0"
+						data-jsl-tab-idx={i}
+						onpointerdown={(e) => {
+							layout.activateTab(node.id, i);
+							layout.startTabDrag(e, tab, node.id, i);
+						}}
+					>
+						{#if renderTabIcon}
+							<span class="jsl-tab-icon-inline">{@render renderTabIcon(tab)}</span>
+						{/if}
+						<span class="jsl-tab-label">{tab.title}</span>
+						{#if !(isOnlyStack && tabs.length <= 1)}
+							<button
+								class="jsl-tab-close"
+								onpointerdown={(e) => e.stopPropagation()}
+								onclick={(e) => {
+									e.stopPropagation();
+									if (e.shiftKey) {
+										if (onshiftclose) onshiftclose(node.id, [...tabs]);
+										else layout.removeStack(node.id);
+									} else {
+										layout.removeTab(node.id, i);
+									}
+								}}
+							>
+								&times;
+							</button>
+						{/if}
+					</div>
+				{/each}
 
-			<!-- Tabs -->
-			{#each node.tabs as tab, i (tab.id)}
-				{@const isActive = i === node.activeTab}
-				{@const isBeingDragged = isDragSource && layout.dragging?.active && layout.dragging.sourceTabIdx === i}
-				<div
-					class="jsl-tab"
-					class:jsl-tab-active={isActive}
-					class:jsl-tab-dragging={isBeingDragged}
-					role="tab"
-					tabindex="0"
-					data-jsl-tab-idx={i}
-					onpointerdown={(e) => {
-						layout.activateTab(node.id, i);
-						layout.startTabDrag(e, tab, node.id, i);
+				{#if layout.onAddTab}
+					<button
+						class="jsl-add-tab"
+						title="Add tab"
+						onpointerdown={(e) => e.stopPropagation()}
+						onclick={(e) => { e.stopPropagation(); layout.onAddTab!(node.id); }}
+					>
+						+
+					</button>
+				{/if}
+			</div>
+
+			<!-- Overflow "more" button (appears when tabs don't fit) -->
+			{#if overflowStacks[node.id]}
+				<button
+					class="jsl-overflow-btn"
+					title="More tabs"
+					onpointerdown={(e) => e.stopPropagation()}
+					onclick={(e) => {
+						e.stopPropagation();
+						toggleOverflow(node.id, e.currentTarget.getBoundingClientRect());
 					}}
 				>
-					<span class="jsl-tab-label">{tab.title}</span>
-					<button
-						class="jsl-tab-close"
-						onpointerdown={(e) => e.stopPropagation()}
-						onclick={(e) => { e.stopPropagation(); layout.removeTab(node.id, i); }}
-					>
-						&times;
-					</button>
-				</div>
-			{/each}
+					&middot;&middot;&middot;
+				</button>
+			{/if}
 
-			<!-- Spacer + area controls -->
-			<div class="jsl-tab-spacer"></div>
+			<!-- Area controls (always visible, never shrink) -->
 			<div class="jsl-area-controls">
 				{#if layout.isMaximized}
 					<button
@@ -180,6 +357,7 @@
 				</button>
 			</div>
 		</div>
+		{/if}
 
 		<!-- Content area -->
 		<div class="jsl-content">
@@ -238,11 +416,13 @@
 		background: var(--jsl-bg);
 		color: var(--jsl-text);
 		user-select: none;
+		position: relative;
 	}
 
 	/* --- Split containers --- */
 	.jsl-split {
 		display: flex;
+		gap: 1px;
 		min-width: 0;
 		min-height: 0;
 		width: 100%;
@@ -268,7 +448,7 @@
 	.jsl-resize-handle::after {
 		content: '';
 		position: absolute;
-		background: var(--jsl-handle-bg);
+		background: transparent;
 		transition: background 0.15s;
 	}
 	.jsl-resize-handle:hover::after,
@@ -310,6 +490,8 @@
 		min-height: 0;
 		overflow: hidden;
 		position: relative;
+		border-radius: 6px;
+		border: 1px solid #2b2b2b;
 	}
 
 	/* --- Tab bar --- */
@@ -317,20 +499,23 @@
 		display: flex;
 		align-items: center;
 		flex-shrink: 0;
-		overflow-x: auto;
+		overflow: hidden;
 		background: var(--jsl-surface);
-		border-bottom: 1px solid var(--jsl-border);
+		border-radius: 5px 5px 0 0;
 	}
 
-	.jsl-tab-icon {
-		width: 24px;
-		height: 100%;
+	/* --- Scrollable tabs container (hidden scrollbar) --- */
+	.jsl-tabs-scroll {
 		display: flex;
 		align-items: center;
-		justify-content: center;
-		flex-shrink: 0;
-		color: var(--jsl-text-dim);
-		border-right: 1px solid var(--jsl-border);
+		flex: 1 1 0%;
+		min-width: 0;
+		overflow-x: auto;
+		scrollbar-width: none;
+		height: 100%;
+	}
+	.jsl-tabs-scroll::-webkit-scrollbar {
+		display: none;
 	}
 
 	/* --- Individual tab --- */
@@ -365,6 +550,14 @@
 		max-width: 120px;
 	}
 
+	.jsl-tab-icon-inline {
+		display: flex;
+		align-items: center;
+		flex-shrink: 0;
+		color: inherit;
+		opacity: var(--jsl-tab-icon-opacity, 0.7);
+	}
+
 	.jsl-tab-close {
 		margin-left: 2px;
 		border-radius: 3px;
@@ -386,12 +579,34 @@
 		opacity: 0.6;
 	}
 
-	/* --- Tab bar spacer + area controls --- */
-	.jsl-tab-spacer {
-		flex: 1;
-		min-width: 8px;
+	/* --- Add tab button --- */
+	.jsl-add-tab {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		width: 20px;
+		height: 20px;
+		flex-shrink: 0;
+		border: none;
+		border-radius: 3px;
+		background: none;
+		color: var(--jsl-text-dim);
+		font-size: 16px;
+		line-height: 1;
+		cursor: pointer;
+		opacity: 0;
+		transition: opacity 0.15s, background 0.15s;
+	}
+	.jsl-add-tab:hover {
+		background: rgba(255, 255, 255, 0.1);
+		color: var(--jsl-text);
+		opacity: 1;
+	}
+	.jsl-stack:hover .jsl-add-tab {
+		opacity: 0.6;
 	}
 
+	/* --- Area controls --- */
 	.jsl-area-controls {
 		display: flex;
 		align-items: center;
@@ -427,11 +642,104 @@
 		opacity: 1;
 	}
 
+	/* --- Overflow "more" button --- */
+	.jsl-overflow-btn {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		flex-shrink: 0;
+		height: 100%;
+		padding: 0 6px;
+		border: none;
+		background: none;
+		color: var(--jsl-text-dim);
+		font-size: 14px;
+		cursor: pointer;
+		letter-spacing: 2px;
+	}
+	.jsl-overflow-btn:hover {
+		color: var(--jsl-text);
+		background: var(--jsl-tab-hover-bg);
+	}
+
+	/* --- Overflow dropdown --- */
+	.jsl-overflow-backdrop {
+		position: fixed;
+		inset: 0;
+		z-index: 99;
+	}
+	.jsl-overflow-dropdown {
+		position: fixed;
+		z-index: 100;
+		min-width: 160px;
+		max-width: 280px;
+		max-height: 300px;
+		overflow-y: auto;
+		background: var(--jsl-surface);
+		border: 1px solid var(--jsl-border);
+		border-radius: 4px;
+		box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+		padding: 2px 0;
+	}
+	.jsl-overflow-item {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		width: 100%;
+		padding: 4px 12px;
+		border: none;
+		background: none;
+		color: var(--jsl-text-muted);
+		font-size: 12px;
+		cursor: pointer;
+		text-align: left;
+		white-space: nowrap;
+	}
+	.jsl-overflow-item:hover {
+		background: var(--jsl-tab-hover-bg);
+		color: var(--jsl-text);
+	}
+	.jsl-overflow-item-active {
+		color: var(--jsl-text);
+		background: var(--jsl-tab-active-bg);
+	}
+
 	/* --- Content area --- */
 	.jsl-content {
 		flex: 1;
 		min-height: 0;
 		overflow: hidden;
+	}
+
+	/* --- Tab-bar collapse/expand hover strip --- */
+	.jsl-collapse-zone {
+		position: absolute;
+		top: 0;
+		left: 0;
+		right: 0;
+		height: 8px;
+		z-index: 15;
+		/* chevron-line-up cursor (Material Symbol): line above chevron pointing up */
+		cursor: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'><g fill='none' stroke='black' stroke-width='4' stroke-linecap='round' stroke-linejoin='round'><path d='M4 5h16'/><path d='M6 15l6-6 6 6'/></g><g fill='none' stroke='white' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M4 5h16'/><path d='M6 15l6-6 6 6'/></g></svg>") 12 4, pointer;
+	}
+	.jsl-collapse-zone-collapsed {
+		height: 6px;
+		/* chevron-line-down cursor: same as chevron-line-up, rotated 180° */
+		cursor: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24'><g transform='rotate(180 12 12)'><g fill='none' stroke='black' stroke-width='4' stroke-linecap='round' stroke-linejoin='round'><path d='M4 5h16'/><path d='M6 15l6-6 6 6'/></g><g fill='none' stroke='white' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M4 5h16'/><path d='M6 15l6-6 6 6'/></g></g></svg>") 12 20, pointer;
+	}
+	.jsl-collapse-zone::after {
+		content: '';
+		position: absolute;
+		top: 0;
+		left: 0;
+		right: 0;
+		height: 2px;
+		background: transparent;
+		transition: background 0.12s, box-shadow 0.12s;
+	}
+	.jsl-collapse-zone:hover::after {
+		background: var(--jsl-accent);
+		box-shadow: 0 0 8px var(--jsl-accent), 0 0 2px var(--jsl-accent);
 	}
 
 	/* --- Drop zone overlay --- */
@@ -454,6 +762,11 @@
 	.jsl-drop-right  { top: 0; bottom: 0; left: 55%; right: 0; }
 	.jsl-drop-top    { top: 0; bottom: 55%; left: 0; right: 0; }
 	.jsl-drop-bottom { top: 55%; bottom: 0; left: 0; right: 0; }
+
+	/* Root-edge drop (higher z-index to cover all stacks) */
+	.jsl-root-drop {
+		z-index: 25;
+	}
 
 	/* --- Drag ghost --- */
 	:global(.jsl-drag-ghost) {

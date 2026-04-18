@@ -5,9 +5,9 @@
 ```
 src/lib/
   types.ts                  — public type definitions (Tab, StackNode, SplitNode, LayoutNode, etc.)
-  tree.ts                   — pure tree algorithms, no Svelte dependency (~270 lines)
-  LayoutState.svelte.ts     — reactive Svelte 5 state class (~330 lines)
-  LayoutArea.svelte         — renderer component with snippets + scoped CSS (~280 lines)
+  tree.ts                   — pure tree algorithms, no Svelte dependency (~360 lines)
+  LayoutState.svelte.ts     — reactive Svelte 5 state class (~425 lines)
+  LayoutArea.svelte         — renderer component with snippets + scoped CSS (~725 lines)
   index.ts                  — public API barrel export
 demo/
   src/routes/+page.svelte   — demo app with colored placeholder panels
@@ -45,6 +45,12 @@ type SplitNode = {
 type LayoutNode = StackNode | SplitNode;
 
 type DropSide = 'top' | 'bottom' | 'left' | 'right' | 'center';
+
+type DropZone = {
+	stackId: string;
+	side: DropSide;
+	rootEdge?: boolean;  // true when targeting container edge for root-level docking
+};
 ```
 
 ### Serialization Types
@@ -116,9 +122,12 @@ cloneTree(node) → LayoutNode
 
 ```typescript
 hitTestDropZone(root, x, y, excludeStackId?, container?, edgeThreshold?) → { stackId, side } | null
+hitTestContainerEdge(container, x, y, threshold?) → 'top' | 'bottom' | 'left' | 'right' | null
 ```
 
-Queries `[data-stack-id]` elements scoped to `container` (defaults to `document`). If cursor is over a target's `[data-jsl-tab-bar]`, forces `side: 'center'` (tab-bar-to-merge). Otherwise: 22% edge threshold for splits, center for merge. The `container` parameter enables nested layout isolation — each `LayoutArea` passes its root element so queries never escape its subtree.
+`hitTestDropZone`: Queries `[data-stack-id]` elements scoped to `container` (defaults to `document`). If cursor is over a target's `[data-jsl-tab-bar]`, forces `side: 'center'` (tab-bar-to-merge). Otherwise: 22% edge threshold for splits, center for merge. The `container` parameter enables nested layout isolation — each `LayoutArea` passes its root element so queries never escape its subtree.
+
+`hitTestContainerEdge`: Checks if the cursor is within `threshold` pixels (default 16) of the layout container edge. Returns the edge side or null. Used during drag to detect root-level docking intent — dropping near a container edge creates a full-width/height panel at the root level rather than splitting an individual stack.
 
 ### Serialization
 
@@ -154,6 +163,7 @@ class LayoutState {
 | `removeTab(stackId, tabIdx)` | Remove a tab (cleanup + clone) |
 | `addTabAnywhere(tab)` | Add to the first available stack |
 | `closeStack(stackId)` | Close area, transfer tabs to nearest stack |
+| `removeStack(stackId)` | Remove stack and all its tabs (no redistribution) |
 | `split(stackId, tab, side)` | Split a stack on an edge |
 | `maximize(stackId)` | Store layout, show single stack |
 | `restore()` | Restore pre-maximize layout |
@@ -164,14 +174,15 @@ class LayoutState {
 | `load(doc)` | Import layout from JSON document |
 | `setLayout(layout)` | Replace entire tree |
 | `LayoutState.createTab(title, type, props?)` | Static helper to create a tab with auto-ID |
+| `init()` | Fire `onTabAdded` for tabs present in the current tree (idempotent — call once after wiring callbacks) |
 
 ### Pointer Event Handlers
 
 Wire to `<svelte:window>`:
 
 ```typescript
-handlePointerMove(e: PointerEvent)  // resize + tab drag + reorder
-handlePointerUp()                   // commit drag/resize
+handlePointerMove(e: PointerEvent)  // resize + tab drag + reorder + root-edge docking
+handlePointerUp()                   // commit drag/resize (including root-edge dock)
 ```
 
 ### Internal Methods (called by LayoutArea)
@@ -186,7 +197,76 @@ activateTab(stackId, tabIdx)            // sets active tab + fires callback
 
 ```typescript
 onActiveStackChange?: (stackId: string, contentType: string) => void
+onAddTab?: (stackId: string) => void  // "+" button in tab bars ($state — can be set reactively)
+onTabAdded?: (tab: Tab) => void       // fires when a tab's id is newly in the tree
+onTabRemoved?: (tab: Tab) => void     // fires when a tab's id leaves the tree entirely
 ```
+
+**Lifecycle hook semantics.** `onTabAdded` and `onTabRemoved` are diff-based: after every mutation, the live tab-id set is compared to the previous set. Only genuine lifecycle transitions fire events:
+
+- Drag-drop (move between stacks) → no events (id persists across the operation).
+- Tab close, `removeStack`, `closeStack` destroying all targets → `onTabRemoved`.
+- `addTab`, `addTabAnywhere`, `split`, `load`, `setLayout` introducing a new id → `onTabAdded`.
+- `maximize`/`restore` → no events (tabs preserved in `_savedLayout`).
+- `activateTab`, resize, reorder-within-stack → no events (membership unchanged).
+
+**Constructor does NOT fire events.** Initial tabs passed via `new LayoutState(initialLayout)` are tracked silently — the consumer hasn't wired callbacks yet. To bootstrap resources for an initial tree, call `init()` after wiring callbacks — or equivalently, construct empty and feed the tree through `setLayout()`:
+
+```typescript
+// Idiomatic:
+const layout = new LayoutState(restoredTree);
+layout.onTabAdded = (tab) => createResourcesFor(tab);
+layout.onTabRemoved = (tab) => destroyResourcesFor(tab);
+layout.init();   // fires onTabAdded for every tab in restoredTree, idempotent
+
+// Equivalent:
+const layout = new LayoutState();
+layout.onTabAdded = (tab) => createResourcesFor(tab);
+layout.onTabRemoved = (tab) => destroyResourcesFor(tab);
+layout.setLayout(restoredTree);
+```
+
+**Timing guarantees.** Both `onTabAdded` and `onTabRemoved`:
+
+1. **Fire synchronously** within the mutating method (or within `init()`), before the method returns. No microtasks, no scheduling.
+2. **Fire after `this.root` has been reassigned** to the new tree. Callbacks can read `this.root`, call `findContentType()`, or walk the tree and see state consistent with the completed mutation.
+3. **Fire exactly once per lifecycle transition.** Drag-drop, which moves a tab between stacks without changing its id, produces no events by design (see drag-identity rule below).
+
+These guarantees are part of the API contract — consumers may rely on them. In particular, they enable the **pre-seed pattern** below.
+
+**Use case: per-tab resource lifecycle.** Render code should be pure reads — creating objects like editors, connections, or subscriptions during render (`{@const x = getOrCreate(tab)}`) crashes when the derived re-evaluates during teardown with a stale/undefined tab. Create resources in `onTabAdded`, destroy in `onTabRemoved`, read them during render via a plain Map lookup.
+
+### Pre-seed pattern for tab creation with initial state
+
+The default `onTabAdded` path creates a resource with default state. For cases that need non-default initialization — cloning from a sibling tab, restoring from a URL, injecting preloaded data — pre-seed the consumer map **before** calling `addTab` / `split`:
+
+```typescript
+// Consumer side:
+const resources = new Map<string, Resource>();
+
+layout.onTabAdded = (tab) => {
+    if (resources.has(tab.id)) return;      // pre-seeded — leave alone
+    resources.set(tab.id, new Resource());   // default path
+};
+layout.onTabRemoved = (tab) => {
+    resources.get(tab.id)?.destroy();
+    resources.delete(tab.id);
+};
+
+// Opening a tab with special initial state:
+function cloneTabFromSibling(stackId: string, sibling: Resource) {
+    const tab = LayoutState.createTab('Cloned', 'my-type');
+    resources.set(tab.id, sibling.clone());  // pre-seed BEFORE addTab
+    layout.addTab(stackId, tab);             // onTabAdded fires sync → sees existing key → no-op
+}
+```
+
+**Why this works:**
+- `LayoutState.createTab` generates the tab id synchronously — the consumer has the id before the layout sees the tab.
+- `onTabAdded` fires synchronously inside `addTab`, after `this.root` is updated.
+- The handler's `if (resources.has(tab.id)) return` tolerates both paths with a single line.
+
+**Why this pattern exists:** It keeps creation-payload APIs off the library surface. JSL never needs to know about consumer resource types, constructor signatures, or clone semantics. The library dispatches lifecycle events; the consumer owns state lifecycle; pre-seeding is the escape hatch for non-default initialization.
 
 ---
 
@@ -203,16 +283,18 @@ Recursive renderer component. Takes a `LayoutState` and consumer snippets.
 | `renderTabIcon` | `(tab) => any` | No | — | Icon in tab bar corner |
 | `renderDragGhost` | `(tab, x, y) => any` | No | default ghost | Custom drag ghost |
 | `class` | `string` | No | `''` | Extra CSS classes on root |
-| `tabBarHeight` | `number` | No | `32` | Tab bar height in px |
-| `resizeHandleSize` | `number` | No | `4` | Visible handle thickness in px |
-| `resizeHitSize` | `number` | No | `resizeHandleSize + 4` | Invisible grab area in px |
+| `style` | `string` | No | `''` | Inline style on root (use for CSS custom property overrides) |
+| `tabBarHeight` | `number` | No | `26` | Tab bar height in px |
+| `resizeHandleSize` | `number` | No | `2` | Visible handle thickness in px |
+| `resizeHitSize` | `number` | No | `10` | Invisible grab area in px |
+| `onshiftclose` | `(stackId, tabs) => void` | No | — | Shift+click close callback (falls back to `layout.removeStack()`) |
 
 ### Rendering Pattern
 
 Recursive `{#snippet}` blocks:
 - `layoutNode(node)` — dispatches to splitPanel or stackPanel
 - `splitPanel(node)` — flex container + resize handles + recurse children
-- `stackPanel(node)` — tab bar + content + maximize/close buttons + drop zone overlay
+- `stackPanel(node)` — tab bar (with overflow detection) + content + maximize/close buttons + drop zone overlay
 
 ### Data Attributes (for hit-testing)
 
@@ -225,11 +307,15 @@ Recursive `{#snippet}` blocks:
 
 ### Area Controls
 
-Each stack has maximize (□/▪) and close (×) buttons in the top-right corner of the tab bar. Invisible by default, fade in on stack hover. Maximize stores/restores layout. Close transfers tabs to nearest stack.
+Each stack has maximize and close buttons in the top-right corner of the tab bar. Invisible by default, fade in on stack hover. Maximize stores/restores layout. Close transfers tabs to nearest stack. The last remaining single-tab stack hides tab close buttons to prevent empty layouts.
+
+### Tab Overflow
+
+When tabs overflow the tab bar, a "..." button appears (detected by `ResizeObserver` + `MutationObserver` comparing `scrollWidth` vs `clientWidth`). Clicking opens a fixed-position dropdown listing all tabs with active-tab highlighting. The dropdown auto-closes on drag start or when overflow clears. Selecting a tab activates it and scrolls it into view.
 
 ### CSS Theming
 
-14 custom properties on `.jsl-root`:
+13 custom properties on `.jsl-root` (+ 1 consumer-overridable with CSS fallback):
 
 ```css
 --jsl-bg: #262626;
@@ -245,6 +331,8 @@ Each stack has maximize (□/▪) and close (×) buttons in the top-right corner
 --jsl-handle-hover: rgba(59, 130, 246, 0.6);
 --jsl-tab-active-bg: #262626;
 --jsl-tab-hover-bg: rgba(38, 38, 38, 0.5);
+/* Consumer-overridable (not defined in root, uses fallback): */
+/* --jsl-tab-icon-opacity: 0.7; */
 ```
 
 All structural classes prefixed `.jsl-*` for targeted overrides.
@@ -265,14 +353,20 @@ pointermove (window) → handlePointerMove()
   if active:
     1. _hitTestTabReorder(x, y) — is cursor in source stack's tab bar?
        YES → reorder mode: swap tabs at midpoint, clear dropZone
-       NO  → cross-stack mode: hitTestDropZone() → update dropZone
+       NO  → check container edges first:
+             hitTestContainerEdge() → root-edge docking (dropZone.rootEdge = true)
+             else → hitTestDropZone() → normal cross-stack drop zone
 
 pointerup (window) → handlePointerUp()
   if active && dropZone:
     1. Remove tab from source
     2. cleanup() ← clean empty source BEFORE splitting
-    3. Re-find target by ID (may have moved after collapse)
-    4. center → addTabToStack / edge → splitStack
+    3. If rootEdge:
+       - Same direction as root → append/prepend to root children
+       - Different direction or root is stack → wrap root in new split
+    4. Else normal:
+       - Re-find target by ID (may have moved after collapse)
+       - center → addTabToStack / edge → splitStack
     5. _cleanupAndApply() ← final cleanup + cloneTree
   clear all drag state
 ```
@@ -281,13 +375,17 @@ pointerup (window) → handlePointerUp()
 
 1. Find source stack element via `[data-stack-id]` scoped to `containerEl`
 2. Find its `[data-jsl-tab-bar]` child
-3. Check cursor Y is within tab bar bounds (±8px tolerance)
+3. Check cursor Y is within tab bar bounds (+/-8px tolerance)
 4. Query `[data-jsl-tab-idx]` elements, find midpoint crossing
 5. Return target index (or null if outside tab bar)
 
 ### Tab-Bar-to-Merge
 
 When dragging over a *different* stack's tab bar, `hitTestDropZone` detects `[data-jsl-tab-bar]` and forces `side: 'center'`. This makes dropping on another stack's tab bar always merge — no accidental top-edge splits.
+
+### Root-Edge Docking
+
+When the cursor is within 16px of the layout container edge during a drag, `hitTestContainerEdge()` returns the edge side and the drop zone is set with `rootEdge: true`. On drop, the new stack is inserted at the root level (not as a child of any existing split), producing full-width/height docked panels. If the root split direction matches, the stack is appended/prepended; otherwise the entire root is wrapped in a new split.
 
 ---
 
@@ -393,8 +491,8 @@ Multiple `LayoutState` instances can coexist. Each `LayoutArea` sets `layout.con
 
 The resize handle has separate visual and grab dimensions to make thin separators easy to grab.
 
-- `resizeHandleSize` (default 4px) — visible line thickness, rendered via `::after` pseudo-element
-- `resizeHitSize` (default `resizeHandleSize + 4`) — actual element width (the grab target)
+- `resizeHandleSize` (default 2px) — visible line thickness, rendered via `::after` pseudo-element
+- `resizeHitSize` (default 10px) — actual element width (the grab target)
 - Negative margins (`margin-inline` / `margin-block`) reclaim the extra space so layout contribution equals `resizeHandleSize`
 - The element itself is `background: transparent`; only the `::after` pseudo is visible
 - Zero layout shift — adjacent panels don't lose a pixel
@@ -408,8 +506,9 @@ The resize handle has separate visual and grab dimensions to make thin separator
 
 ### General invariant: no empty space
 
-1. Every split has ≥2 children (cleanup collapses single-child splits)
-2. Every stack has ≥1 tab (cleanup removes empty stacks, `closeStack` transfers tabs)
+1. Every split has >=2 children (cleanup collapses single-child splits)
+2. Every stack has >=1 tab (cleanup removes empty stacks, `closeStack` transfers tabs)
 3. Sibling sizes always sum to ~1.0 (normalized after every mutation)
 4. The root is always a valid node (fallback to empty stack if cleanup returns null)
 5. The DOM always reflects the current tree state (clone after structural changes)
+6. Last remaining single-tab stack hides close buttons (prevents empty layout)
