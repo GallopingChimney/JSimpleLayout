@@ -200,7 +200,10 @@ onActiveStackChange?: (stackId: string, contentType: string) => void
 onAddTab?: (stackId: string) => void  // "+" button in tab bars ($state — can be set reactively)
 onTabAdded?: (tab: Tab) => void       // fires when a tab's id is newly in the tree
 onTabRemoved?: (tab: Tab) => void     // fires when a tab's id leaves the tree entirely
+canRemoveTab?: (tab: Tab) => boolean | Promise<boolean>  // UI close-button guard (see below)
 ```
+
+**`canRemoveTab` — pre-close guard.** Called by LayoutArea's tab close button *before* `removeTab()`. If the callback returns `false` (or a Promise resolving to `false`), the close is cancelled — `removeTab()` is never called. Supports async (e.g., showing a save dialog). Not called for programmatic `removeTab()` — only the UI close button. Shift+click close routes through `onshiftclose`, not this guard.
 
 **Lifecycle hook semantics.** `onTabAdded` and `onTabRemoved` are diff-based: after every mutation, the live tab-id set is compared to the previous set. Only genuine lifecycle transitions fire events:
 

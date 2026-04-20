@@ -2,7 +2,7 @@
 	import { onMount, tick } from 'svelte';
 	import type { LayoutNode, StackNode, SplitNode, Tab, DropZone } from './types.js';
 	import { LayoutState } from './LayoutState.svelte.js';
-	import { findStack } from './tree.js';
+	import { findStack, cloneTree } from './tree.js';
 
 	let rootEl: HTMLElement;
 
@@ -16,6 +16,8 @@
 		tabBarHeight = 26,
 		resizeHandleSize = 2,
 		resizeHitSize = 10,
+		showPinButtons = false,
+		pinOnHover = true,
 		onshiftclose,
 	}: {
 		/** The reactive layout state instance. */
@@ -36,9 +38,18 @@
 		resizeHandleSize?: number;
 		/** Resize handle grab area in pixels (default matches resizeHandleSize). */
 		resizeHitSize?: number;
+		/** Show pin/unpin buttons on tabs (default false). */
+		showPinButtons?: boolean;
+		/** When true, unpinned pin buttons are hidden until tab hover (default true). */
+		pinOnHover?: boolean;
 		/** Callback when Shift+click on a tab close button (close entire area). Receives stack ID and its tabs. If not set, falls back to layout.removeStack(). */
 		onshiftclose?: (stackId: string, tabs: Tab[]) => void;
 	} = $props();
+
+	function togglePin(tab: Tab) {
+		tab.pinned = !tab.pinned;
+		layout.root = cloneTree(layout.root);
+	}
 
 	onMount(() => {
 		layout.containerEl = rootEl;
@@ -270,6 +281,7 @@
 						class="jsl-tab"
 						class:jsl-tab-active={isActive}
 						class:jsl-tab-dragging={isBeingDragged}
+						class:jsl-tab-pinned={tab.pinned}
 						role="tab"
 						tabindex="0"
 						data-jsl-tab-idx={i}
@@ -282,23 +294,45 @@
 							<span class="jsl-tab-icon-inline">{@render renderTabIcon(tab)}</span>
 						{/if}
 						<span class="jsl-tab-label">{tab.title}</span>
-						{#if !(isOnlyStack && tabs.length <= 1)}
-							<button
-								class="jsl-tab-close"
-								onpointerdown={(e) => e.stopPropagation()}
-								onclick={(e) => {
-									e.stopPropagation();
-									if (e.shiftKey) {
-										if (onshiftclose) onshiftclose(node.id, [...tabs]);
-										else layout.removeStack(node.id);
-									} else {
-										layout.removeTab(node.id, i);
-									}
-								}}
-							>
-								&times;
-							</button>
-						{/if}
+						<span class="jsl-tab-actions">
+							{#if !(isOnlyStack && tabs.length <= 1)}
+								<button
+									class="jsl-tab-btn jsl-tab-close"
+									onpointerdown={(e) => e.stopPropagation()}
+									onclick={async (e) => {
+										e.stopPropagation();
+										if (e.shiftKey) {
+											if (onshiftclose) onshiftclose(node.id, [...tabs]);
+											else layout.removeStack(node.id);
+										} else {
+											if (layout.canRemoveTab) {
+												const allowed = await layout.canRemoveTab(tab);
+												if (!allowed) return;
+											}
+											layout.removeTab(node.id, i);
+										}
+									}}
+								>
+									<svg width="14" height="14" viewBox="0 -960 960 960" fill="currentColor">
+										<path d="m256-200-56-56 224-224-224-224 56-56 224 224 224-224 56 56-224 224 224 224-56 56-224-224-224 224Z"/>
+									</svg>
+								</button>
+							{/if}
+							{#if showPinButtons}
+								<button
+									class="jsl-tab-btn jsl-tab-pin"
+									class:jsl-tab-pin-active={tab.pinned}
+									class:jsl-tab-pin-hover={pinOnHover && !tab.pinned}
+									title={tab.pinned ? 'Unpin tab' : 'Pin tab'}
+									onpointerdown={(e) => e.stopPropagation()}
+									onclick={(e) => { e.stopPropagation(); togglePin(tab); }}
+								>
+									<svg width="14" height="14" viewBox="0 -960 960 960" fill={tab.pinned ? '#0ff' : 'currentColor'}>
+										<path d="m643.22-499.78 96 96v98.56H529v225.74l-49 49-49-49v-225.74H220.78v-98.56l96-96v-249.31h-48v-98h422.44v98h-48v249.31Z" />
+									</svg>
+								</button>
+							{/if}
+						</span>
 					</div>
 				{/each}
 
@@ -558,25 +592,52 @@
 		opacity: var(--jsl-tab-icon-opacity, 0.7);
 	}
 
-	.jsl-tab-close {
+	.jsl-tab-pinned {
+		cursor: default;
+	}
+
+	.jsl-tab-actions {
+		display: flex;
+		align-items: center;
+		gap: 0;
 		margin-left: 2px;
+		flex-shrink: 0;
+	}
+
+	.jsl-tab-btn {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		width: 18px;
+		height: 18px;
 		border-radius: 3px;
-		padding: 0 3px;
-		font-size: 14px;
-		line-height: 1;
+		padding: 0;
 		opacity: 0;
-		color: var(--jsl-text-muted);
+		color: var(--jsl-text-dim);
 		background: none;
 		border: none;
 		cursor: pointer;
+		transition: opacity 0.12s, background 0.12s;
 	}
-	.jsl-tab-close:hover {
+	.jsl-tab-btn:hover {
 		background: rgba(255, 255, 255, 0.1);
+		color: var(--jsl-text);
 		opacity: 1;
 	}
-	.jsl-tab:hover .jsl-tab-close,
-	.jsl-tab-active .jsl-tab-close {
-		opacity: 0.6;
+	.jsl-tab:hover .jsl-tab-btn,
+	.jsl-tab-active .jsl-tab-btn {
+		opacity: 0.5;
+	}
+
+	.jsl-tab-pin-hover {
+		display: none;
+	}
+	.jsl-tab:hover .jsl-tab-pin-hover {
+		display: flex;
+	}
+
+	.jsl-tab-pin-active {
+		opacity: 0.7 !important;
 	}
 
 	/* --- Add tab button --- */

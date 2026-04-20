@@ -80,6 +80,11 @@ export class LayoutState {
 	 *  Drag-drop does NOT fire this — tab identity survives the move. */
 	onTabRemoved?: (tab: Tab) => void;
 
+	/** Optional guard called before a tab is closed via the UI close button.
+	 *  Return false (or a Promise resolving to false) to prevent removal.
+	 *  Not called for programmatic removeTab() — only the UI close button. */
+	canRemoveTab?: (tab: Tab) => boolean | Promise<boolean>;
+
 	/** Tabs currently live in the tree, keyed by id. Used for diff-based lifecycle events. */
 	private _knownTabs = new Map<string, Tab>();
 
@@ -186,6 +191,29 @@ export class LayoutState {
 	/** Create a new tab with a generated ID. */
 	static createTab(title: string, contentType: string, props?: Record<string, any>): Tab {
 		return { id: uid(), title, contentType, ...(props ? { props } : {}) };
+	}
+
+	/** Update a tab's title by tab ID. No-op if the tab isn't found or the title is unchanged. */
+	renameTab(tabId: string, newTitle: string): void {
+		const tab = this._findTabById(tabId);
+		if (!tab || tab.title === newTitle) return;
+		tab.title = newTitle;
+		this.root = cloneTree(this.root);
+	}
+
+	private _findTabById(tabId: string): Tab | null {
+		return this._walkTabs(this.root, tabId);
+	}
+
+	private _walkTabs(node: LayoutNode, tabId: string): Tab | null {
+		if (node.type === 'stack') {
+			return (node as StackNode).tabs.find(t => t.id === tabId) ?? null;
+		}
+		for (const child of (node as SplitNode).children) {
+			const found = this._walkTabs(child, tabId);
+			if (found) return found;
+		}
+		return null;
 	}
 
 	// -----------------------------------------------------------------------
@@ -436,6 +464,7 @@ export class LayoutState {
 
 	/** Start dragging a tab. Called from tab pointerdown. */
 	startTabDrag(e: PointerEvent, tab: Tab, stackId: string, tabIdx: number): void {
+		if (tab.pinned) return;
 		e.preventDefault();
 		this.dragging = {
 			tab, sourceStackId: stackId, sourceTabIdx: tabIdx,
