@@ -8,6 +8,8 @@ export type Tab = {
 	contentType: string;
 	/** Optional data passed to the content renderer. */
 	props?: Record<string, any>;
+	/** When true, the tab cannot be dragged or reordered. */
+	pinned?: boolean;
 };
 
 /** Leaf node — a tabbed panel group. One tab is active at a time. */
@@ -62,4 +64,5 @@ export interface SerializedTab {
 	title: string;
 	contentType: string;
 	props?: Record<string, any>;
+	pinned?: boolean;
 }

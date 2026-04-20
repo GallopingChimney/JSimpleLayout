@@ -141,7 +141,8 @@ export function addTabToStack(
 	return true;
 }
 
-/** Reorder a tab within a stack. Returns true if the swap happened. */
+/** Reorder a tab within a stack. Returns true if the swap happened.
+ *  Refuses to move a pinned tab or to displace a pinned tab from its position. */
 export function reorderTab(
 	root: LayoutNode,
 	stackId: string,
@@ -152,6 +153,7 @@ export function reorderTab(
 	if (!stack || fromIdx === toIdx) return false;
 	if (fromIdx < 0 || fromIdx >= stack.tabs.length) return false;
 	if (toIdx < 0 || toIdx >= stack.tabs.length) return false;
+	if (stack.tabs[fromIdx].pinned || stack.tabs[toIdx].pinned) return false;
 	const [tab] = stack.tabs.splice(fromIdx, 1);
 	stack.tabs.splice(toIdx, 0, tab);
 	stack.activeTab = toIdx;
@@ -242,6 +244,7 @@ export function serialize(root: LayoutNode, name?: string): LayoutDocument {
 					title: t.title,
 					contentType: t.contentType,
 					...(t.props ? { props: t.props } : {}),
+					...(t.pinned ? { pinned: true } : {}),
 				})),
 				activeTab: node.activeTab,
 			};
@@ -268,6 +271,7 @@ export function deserialize(doc: LayoutDocument): LayoutNode {
 					title: t.title,
 					contentType: t.contentType,
 					...(t.props ? { props: t.props } : {}),
+					...(t.pinned ? { pinned: true } : {}),
 				})),
 				activeTab: s.activeTab ?? 0,
 			};
