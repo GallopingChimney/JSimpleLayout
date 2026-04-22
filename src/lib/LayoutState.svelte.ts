@@ -1,6 +1,6 @@
 // JSimpleLayout — Reactive layout state manager (Svelte 5)
 
-import type { LayoutNode, StackNode, SplitNode, Tab, DropSide, DropZone, LayoutDocument } from './types.js';
+import type { LayoutNode, StackNode, SplitNode, Tab, TabTopEdge, DropSide, DropZone, LayoutDocument } from './types.js';
 import {
 	uid, resetUids, findStack, findSplit, findFirstStack, findStackByContentType,
 	cleanup, cloneTree, addTabToStack, removeTabFromStack, reorderTab, splitStack,
@@ -61,8 +61,8 @@ export class LayoutState {
 	/** DOM container for scoping queries (set by LayoutArea). */
 	containerEl: HTMLElement | null = null;
 
-	/** Saved layout for maximize/restore. */
-	private _savedLayout: LayoutNode | null = null;
+	/** Saved layout for maximize/restore. Reactive so `isMaximized` triggers UI updates. */
+	private _savedLayout = $state.raw<LayoutNode | null>(null);
 
 	/** Callback when the active stack changes. */
 	onActiveStackChange?: (stackId: string, contentType: string) => void;
@@ -147,6 +147,10 @@ export class LayoutState {
 	private _reconcileTabs(): void {
 		const current = new Map<string, Tab>();
 		this._collectTabs(this.root, current);
+		// When maximized, tabs hidden in _savedLayout are NOT removed —
+		// they're just temporarily invisible. Include them so reconcile
+		// doesn't fire spurious onTabRemoved.
+		if (this._savedLayout) this._collectTabs(this._savedLayout, current);
 		if (this.onTabRemoved) {
 			for (const [id, tab] of this._knownTabs) {
 				if (!current.has(id)) this.onTabRemoved(tab);
@@ -189,8 +193,15 @@ export class LayoutState {
 	}
 
 	/** Create a new tab with a generated ID. */
-	static createTab(title: string, contentType: string, props?: Record<string, any>): Tab {
-		return { id: uid(), title, contentType, ...(props ? { props } : {}) };
+	static createTab(title: string, contentType: string, props?: Record<string, any>, options?: { pinned?: boolean; topEdge?: TabTopEdge }): Tab {
+		return {
+			id: uid(),
+			title,
+			contentType,
+			...(props ? { props } : {}),
+			...(options?.pinned ? { pinned: true } : {}),
+			...(options?.topEdge ? { topEdge: { ...options.topEdge } } : {}),
+		};
 	}
 
 	/** Update a tab's title by tab ID. No-op if the tab isn't found or the title is unchanged. */
@@ -240,8 +251,10 @@ export class LayoutState {
 	//  Public API — Close stack
 	// -----------------------------------------------------------------------
 
-	/** Close a stack, transferring its tabs to the nearest other stack. */
-	closeStack(stackId: string): void {
+	/** Close a stack, transferring its tabs to the nearest other stack.
+	 *  When `preserveActiveTab` is true, the receiving stack keeps its current
+	 *  active tab instead of switching to the last transferred tab. */
+	closeStack(stackId: string, opts?: { preserveActiveTab?: boolean }): void {
 		const stack = findStack(this.root, stackId);
 		if (!stack) return;
 		// Collect tabs to redistribute
@@ -258,7 +271,9 @@ export class LayoutState {
 				for (const tab of tabs) {
 					target.tabs.push(tab);
 				}
-				target.activeTab = target.tabs.length - 1;
+				if (!opts?.preserveActiveTab) {
+					target.activeTab = target.tabs.length - 1;
+				}
 				this.root = cloneTree(this.root);
 			}
 		}
@@ -317,9 +332,11 @@ export class LayoutState {
 	//  Public API — Serialization
 	// -----------------------------------------------------------------------
 
-	/** Serialize the current layout to a persistable document. */
+	/** Serialize the current layout to a persistable document.
+	 *  When maximized, serializes the full (pre-maximize) layout so
+	 *  persistence doesn't lose hidden panels. */
 	serialize(name?: string): LayoutDocument {
-		return serialize(this.root, name);
+		return serialize(this._savedLayout ?? this.root, name);
 	}
 
 	/** Load a layout from a serialized document. */

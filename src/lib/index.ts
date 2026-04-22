@@ -3,6 +3,8 @@
 // Types
 export type {
 	Tab,
+	TabTopEdge,
+	TabTopEdgeVisibility,
 	StackNode,
 	SplitNode,
 	LayoutNode,

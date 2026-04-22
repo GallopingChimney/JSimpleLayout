@@ -1,6 +1,17 @@
 // JSimpleLayout — Type definitions
 
 /** A single tab within a stack panel. */
+export type TabTopEdgeVisibility = 'always' | 'muted' | 'transparent';
+
+/** Optional colored accent edge rendered along the top of a tab header. */
+export type TabTopEdge = {
+	color: string;
+	/** Thickness in CSS pixels. */
+	thickness: number;
+	/** How the edge behaves while the tab is inactive. */
+	inactiveVisibility?: TabTopEdgeVisibility;
+};
+
 export type Tab = {
 	id: string;
 	title: string;
@@ -10,6 +21,8 @@ export type Tab = {
 	props?: Record<string, any>;
 	/** When true, the tab cannot be dragged or reordered. */
 	pinned?: boolean;
+	/** Optional accent edge rendered along the tab's top border. */
+	topEdge?: TabTopEdge;
 };
 
 /** Leaf node — a tabbed panel group. One tab is active at a time. */
@@ -65,4 +78,5 @@ export interface SerializedTab {
 	contentType: string;
 	props?: Record<string, any>;
 	pinned?: boolean;
+	topEdge?: TabTopEdge;
 }

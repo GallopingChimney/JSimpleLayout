@@ -19,6 +19,7 @@
 		showPinButtons = false,
 		pinOnHover = true,
 		onshiftclose,
+		onareaclose,
 	}: {
 		/** The reactive layout state instance. */
 		layout: LayoutState;
@@ -44,11 +45,28 @@
 		pinOnHover?: boolean;
 		/** Callback when Shift+click on a tab close button (close entire area). Receives stack ID and its tabs. If not set, falls back to layout.removeStack(). */
 		onshiftclose?: (stackId: string, tabs: Tab[]) => void;
+		/** Callback when the area close button (×) is clicked (without Shift). Receives stack ID and its tabs. If not set, falls back to layout.removeStack(). Shift+click always transfers tabs via layout.closeStack() with preserveActiveTab. */
+		onareaclose?: (stackId: string, tabs: Tab[]) => void;
 	} = $props();
 
 	function togglePin(tab: Tab) {
 		tab.pinned = !tab.pinned;
 		layout.root = cloneTree(layout.root);
+	}
+
+	function tabTopEdgeStyle(tab: Tab, isActive: boolean): string {
+		if (!tab.topEdge || tab.topEdge.thickness <= 0 || !tab.topEdge.color) return '';
+		const inactiveVisibility = tab.topEdge.inactiveVisibility ?? 'muted';
+		const inactiveOpacity = inactiveVisibility === 'transparent'
+			? 0
+			: inactiveVisibility === 'muted'
+				? 0.4
+				: 1;
+		return [
+			`--jsl-tab-top-edge-color:${tab.topEdge.color}`,
+			`--jsl-tab-top-edge-thickness:${tab.topEdge.thickness}px`,
+			`--jsl-tab-top-edge-opacity:${isActive ? 1 : inactiveOpacity}`,
+		].join(';');
 	}
 
 	onMount(() => {
@@ -285,6 +303,7 @@
 						role="tab"
 						tabindex="0"
 						data-jsl-tab-idx={i}
+						style={tabTopEdgeStyle(tab, isActive)}
 						onpointerdown={(e) => {
 							layout.activateTab(node.id, i);
 							layout.startTabDrag(e, tab, node.id, i);
@@ -385,7 +404,14 @@
 				<button
 					class="jsl-area-btn"
 					title="Close area"
-					onclick={() => layout.closeStack(node.id)}
+					onclick={(e) => {
+						if (e.shiftKey) {
+							layout.closeStack(node.id, { preserveActiveTab: true });
+						} else {
+							if (onareaclose) onareaclose(node.id, [...tabs]);
+							else layout.removeStack(node.id);
+						}
+					}}
 				>
 					&times;
 				</button>
@@ -554,6 +580,7 @@
 
 	/* --- Individual tab --- */
 	.jsl-tab {
+		position: relative;
 		display: flex;
 		align-items: center;
 		gap: 4px;
@@ -564,6 +591,20 @@
 		white-space: nowrap;
 		border-right: 1px solid rgba(64, 64, 64, 0.3);
 		color: var(--jsl-text-muted);
+		overflow: hidden;
+	}
+	.jsl-tab::before {
+		content: '';
+		position: absolute;
+		top: 0;
+		left: 0;
+		right: 0;
+		height: var(--jsl-tab-top-edge-thickness, 0);
+		background: var(--jsl-tab-top-edge-color, transparent);
+		opacity: var(--jsl-tab-top-edge-opacity, 0);
+		z-index: 1;
+		pointer-events: none;
+		transition: opacity 0.12s ease;
 	}
 	.jsl-tab:hover {
 		color: var(--jsl-text);

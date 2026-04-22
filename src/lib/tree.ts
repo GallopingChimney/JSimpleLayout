@@ -117,7 +117,13 @@ export function cleanup(node: LayoutNode): LayoutNode | null {
  */
 export function cloneTree(node: LayoutNode): LayoutNode {
 	if (node.type === 'stack') {
-		return { ...node, tabs: node.tabs.map(t => ({ ...t })) };
+		return {
+			...node,
+			tabs: node.tabs.map(t => ({
+				...t,
+				...(t.topEdge ? { topEdge: { ...t.topEdge } } : {}),
+			})),
+		};
 	}
 	return { ...node, children: (node as SplitNode).children.map(c => cloneTree(c)) };
 }
@@ -245,6 +251,7 @@ export function serialize(root: LayoutNode, name?: string): LayoutDocument {
 					contentType: t.contentType,
 					...(t.props ? { props: t.props } : {}),
 					...(t.pinned ? { pinned: true } : {}),
+					...(t.topEdge ? { topEdge: { ...t.topEdge } } : {}),
 				})),
 				activeTab: node.activeTab,
 			};
@@ -272,6 +279,7 @@ export function deserialize(doc: LayoutDocument): LayoutNode {
 					contentType: t.contentType,
 					...(t.props ? { props: t.props } : {}),
 					...(t.pinned ? { pinned: true } : {}),
+					...(t.topEdge ? { topEdge: { ...t.topEdge } } : {}),
 				})),
 				activeTab: s.activeTab ?? 0,
 			};
